@@ -1,0 +1,26 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk-channel: [release, dev]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with ufbt
+        uses: flipperdevices/flipperzero-ufbt-action@v0.1
+        id: build-app
+        with:
+          sdk-channel: ${{ matrix.sdk-channel }}
+      - name: Upload app artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: timeto-${{ matrix.sdk-channel }}-${{ steps.build-app.outputs.suffix }}
+          path: ${{ steps.build-app.outputs.fap-artifacts }}

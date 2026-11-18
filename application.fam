@@ -1,0 +1,12 @@
+App(
+    appid="timeto",
+    name="TimeTo",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="timeto_app",
+    requires=["gui", "storage", "notification"],
+    stack_size=4 * 1024,
+    fap_icon="timeto.png",
+    fap_category="Tools",
+    fap_version="1.0",
+    fap_description="Continuous time tracker. Always tracking one activity; logs to SD card.",
+)
