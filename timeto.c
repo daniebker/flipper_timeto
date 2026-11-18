@@ -308,8 +308,8 @@ static void load_current(TimeToApp* app) {
 
 static void append_log(TimeToApp* app, uint32_t start, uint32_t end, const char* name) {
     if(end <= start) return;
-    char start_str[24];
-    char end_str[24];
+    char start_str[32];
+    char end_str[32];
     format_datetime(start, start_str, sizeof(start_str));
     format_datetime(end, end_str, sizeof(end_str));
 
