@@ -13,6 +13,10 @@
  *   /ext/apps_data/timeto/log.csv         finished intervals
  *   /ext/apps_data/timeto/tags.txt        NFC tags: "<uid hex>,<activity>"
  *
+ * The start time of the running interval can be changed (Edit > Change start
+ * time). If the previous interval ended where the running one began, its end
+ * moves too, so the timeline stays continuous.
+ *
  * NFC: scanning a linked tag (any ISO14443-3A tag: NTAG, Ultralight, Mifare
  * Classic, DESFire...) switches to its activity. An unknown tag is linked to
  * an activity the first time it is scanned.
@@ -54,6 +58,8 @@
 #define SUMMARY_MAX      (MAX_ACTIVITIES + 4)
 #define MAX_TAGS         32
 #define UID_STR_LEN      (ISO14443_3A_MAX_UID_SIZE * 2 + 1)
+#define LOG_TAIL         256 /* bytes read from the end of log.csv to find the last row */
+#define LOG_NAME_LEN     64
 
 static const char* const default_activities[] = {
     "Work",
@@ -78,6 +84,7 @@ typedef enum {
     ViewNfcScan,
     ViewNfcLink,
     ViewNfcUnlink,
+    ViewStartEdit,
 } TimeToView;
 
 typedef enum {
@@ -86,6 +93,7 @@ typedef enum {
 } TimeToEvent;
 
 typedef enum {
+    ManageStartTime,
     ManageAdd,
     ManageDelete,
     ManageNfcLink,
@@ -101,6 +109,26 @@ typedef struct {
 typedef struct {
     bool link_mode;
 } NfcScanModel;
+
+/* Last finished interval in log.csv. */
+typedef struct {
+    bool found;
+    uint32_t start;
+    uint32_t end;
+    char name[LOG_NAME_LEN];
+    uint64_t offset; /* byte offset of the row in log.csv */
+} LastLog;
+
+typedef struct {
+    char name[NAME_LEN];
+    uint32_t start; /* proposed start */
+    uint32_t min; /* earliest allowed start */
+    uint32_t now;
+    bool has_prev; /* previous interval ends where this one starts and moves with it */
+    char prev_name[NAME_LEN];
+    uint32_t prev_start;
+    uint8_t field; /* 0 = hours, 1 = minutes */
+} StartEditModel;
 
 typedef struct {
     bool tracking;
@@ -134,6 +162,7 @@ typedef struct {
     View* nfc_scan_view;
     Submenu* nfc_link_menu;
     Submenu* nfc_unlink_menu;
+    View* start_edit_view;
     FuriTimer* timer;
 
     /* NFC: allocated only while scanning, so the app doesn't hold the radio */
@@ -160,6 +189,9 @@ typedef struct {
 
     uint32_t summary_day_offset; /* 0 = today, 1 = yesterday, ... */
     char input_buf[NAME_LEN];
+
+    /* last log row, read when the start time editor is opened */
+    LastLog edit_last;
 
     /* scratch buffers for totals */
     char tmp_names[SUMMARY_MAX][NAME_LEN];
@@ -348,14 +380,12 @@ static void load_current(TimeToApp* app) {
     read_lines(app, CURRENT_PATH, current_line_cb, app);
 }
 
-static void append_log(TimeToApp* app, uint32_t start, uint32_t end, const char* name) {
-    if(end <= start) return;
+static FuriString* format_log_line(uint32_t start, uint32_t end, const char* name) {
     char start_str[32];
     char end_str[32];
     format_datetime(start, start_str, sizeof(start_str));
     format_datetime(end, end_str, sizeof(end_str));
-
-    FuriString* line = furi_string_alloc_printf(
+    return furi_string_alloc_printf(
         "%lu,%lu,%lu,%s,%s,%s\n",
         (unsigned long)start,
         (unsigned long)end,
@@ -363,6 +393,30 @@ static void append_log(TimeToApp* app, uint32_t start, uint32_t end, const char*
         start_str,
         end_str,
         name);
+}
+
+/* log line: start_ts,end_ts,duration_s,start,end,activity */
+static bool parse_log_line(const char* line, uint32_t* start, uint32_t* end, const char** name) {
+    if(line[0] < '0' || line[0] > '9') return false; /* header or garbage */
+    char* p;
+    *start = strtoul(line, &p, 10);
+    if(*p != ',') return false;
+    *end = strtoul(p + 1, NULL, 10);
+
+    /* activity is after the 5th comma */
+    const char* n = line;
+    for(int i = 0; i < 5; i++) {
+        n = strchr(n, ',');
+        if(!n) return false;
+        n++;
+    }
+    *name = n;
+    return true;
+}
+
+static void append_log(TimeToApp* app, uint32_t start, uint32_t end, const char* name) {
+    if(end <= start) return;
+    FuriString* line = format_log_line(start, end, name);
 
     File* file = storage_file_alloc(app->storage);
     if(storage_file_open(file, LOG_PATH, FSAM_WRITE, FSOM_OPEN_APPEND)) {
@@ -379,6 +433,55 @@ static void append_log(TimeToApp* app, uint32_t start, uint32_t end, const char*
     storage_file_close(file);
     storage_file_free(file);
     furi_string_free(line);
+}
+
+/* Reads the last row of log.csv. Only the tail of the file is read. */
+static void read_last_log(TimeToApp* app, LastLog* out) {
+    memset(out, 0, sizeof(*out));
+    File* file = storage_file_alloc(app->storage);
+    if(storage_file_open(file, LOG_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        uint64_t size = storage_file_size(file);
+        uint64_t from = size > LOG_TAIL ? size - LOG_TAIL : 0;
+        char buf[LOG_TAIL + 1];
+        size_t n = 0;
+        if(storage_file_seek(file, (uint32_t)from, true)) {
+            n = storage_file_read(file, buf, LOG_TAIL);
+        }
+        buf[n] = '\0';
+        while(n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
+        char* line = strrchr(buf, '\n');
+        line = line ? line + 1 : (from == 0 ? buf : NULL); /* NULL: row longer than the tail */
+
+        uint32_t start, end;
+        const char* name;
+        if(line && parse_log_line(line, &start, &end, &name)) {
+            out->found = true;
+            out->start = start;
+            out->end = end;
+            strlcpy(out->name, name, sizeof(out->name));
+            out->offset = from + (uint64_t)(line - buf);
+        }
+    }
+    storage_file_close(file);
+    storage_file_free(file);
+}
+
+/* Replaces the last row of log.csv with the same interval ending at new_end. */
+static bool rewrite_last_log_end(TimeToApp* app, const LastLog* last, uint32_t new_end) {
+    if(!last->found || new_end <= last->start) return false;
+    FuriString* line = format_log_line(last->start, new_end, last->name);
+    File* file = storage_file_alloc(app->storage);
+    bool ok = false;
+    if(storage_file_open(file, LOG_PATH, FSAM_READ_WRITE, FSOM_OPEN_EXISTING)) {
+        size_t len = furi_string_size(line);
+        ok = storage_file_seek(file, (uint32_t)last->offset, true) && storage_file_truncate(file) &&
+             storage_file_write(file, furi_string_get_cstr(line), len) == len;
+    }
+    storage_file_close(file);
+    storage_file_free(file);
+    furi_string_free(line);
+    if(!ok) FURI_LOG_E(TAG, "Failed to rewrite last log row");
+    return ok;
 }
 
 static int find_tag(TimeToApp* app, const char* uid) {
@@ -462,24 +565,11 @@ static void totals_add(TotalsCtx* t, const char* name, uint32_t secs) {
     t->count++;
 }
 
-/* log line: start_ts,end_ts,duration_s,start,end,activity */
 static void totals_line_cb(const char* line, void* ctx) {
     TotalsCtx* t = ctx;
-    if(line[0] < '0' || line[0] > '9') return; /* header or garbage */
-
-    char* p;
-    uint32_t start = strtoul(line, &p, 10);
-    if(*p != ',') return;
-    uint32_t end = strtoul(p + 1, NULL, 10);
-
-    /* activity is after the 5th comma */
-    const char* name = line;
-    for(int i = 0; i < 5; i++) {
-        name = strchr(name, ',');
-        if(!name) return;
-        name++;
-    }
-
+    uint32_t start, end;
+    const char* name;
+    if(!parse_log_line(line, &start, &end, &name)) return;
     totals_add(t, name, overlap(start, end, t->from, t->to));
 }
 
@@ -647,6 +737,172 @@ static void switch_activity(TimeToApp* app, const char* name) {
     refresh_today_prev(app);
     tracker_update_model(app);
     notification_message(app->notifications, &sequence_single_vibro);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Change start time                                                        */
+/* ------------------------------------------------------------------------ */
+
+/* The previous interval moves with the start only if it ended exactly where the
+ * running one began (i.e. it was ended by a switch, not by "Stop tracking"). */
+static bool start_edit_prev_linked(TimeToApp* app) {
+    return app->edit_last.found && app->edit_last.end == app->current_start &&
+           app->edit_last.start < app->current_start;
+}
+
+static void start_edit_open(TimeToApp* app) {
+    read_last_log(app, &app->edit_last);
+    bool linked = start_edit_prev_linked(app);
+
+    /* Earliest start: keep at least a minute of the linked previous interval,
+     * otherwise don't overlap the last logged interval. */
+    uint32_t min = 0;
+    if(linked) {
+        min = app->edit_last.start + 60;
+    } else if(app->edit_last.found) {
+        min = app->edit_last.end;
+    }
+    if(min > app->current_start) min = app->current_start;
+
+    with_view_model(
+        app->start_edit_view,
+        StartEditModel * m,
+        {
+            strlcpy(m->name, app->current, NAME_LEN);
+            m->start = app->current_start;
+            m->min = min;
+            m->now = now_ts();
+            m->has_prev = linked;
+            strlcpy(m->prev_name, linked ? app->edit_last.name : "", NAME_LEN);
+            m->prev_start = linked ? app->edit_last.start : 0;
+            m->field = 0;
+        },
+        true);
+    view_dispatcher_switch_to_view(app->view_dispatcher, ViewStartEdit);
+}
+
+static void start_edit_apply(TimeToApp* app, uint32_t new_start) {
+    if(!app->tracking || new_start == app->current_start) return;
+    uint32_t now = now_ts();
+    if(new_start > now) new_start = now;
+
+    if(start_edit_prev_linked(app)) {
+        if(new_start <= app->edit_last.start) return;
+        if(!rewrite_last_log_end(app, &app->edit_last, new_start)) return;
+    } else if(app->edit_last.found && new_start < app->edit_last.end) {
+        new_start = app->edit_last.end;
+    }
+
+    app->current_start = new_start;
+    save_current(app);
+    refresh_today_prev(app);
+    tracker_update_model(app);
+    notification_message(app->notifications, &sequence_single_vibro);
+}
+
+static void start_edit_draw(Canvas* canvas, void* ctx) {
+    StartEditModel* m = ctx;
+    char buf[32];
+    canvas_clear(canvas);
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, 0, 0, AlignLeft, AlignTop, "Start time");
+
+    canvas_set_font(canvas, FontSecondary);
+    uint32_t start_day = m->start / SECONDS_PER_DAY;
+    uint32_t today = m->now / SECONDS_PER_DAY;
+    if(start_day == today) {
+        strlcpy(buf, "Today", sizeof(buf));
+    } else if(start_day + 1 == today) {
+        strlcpy(buf, "Yesterday", sizeof(buf));
+    } else {
+        format_date(m->start, buf, sizeof(buf));
+    }
+    canvas_draw_str_aligned(canvas, 127, 1, AlignRight, AlignTop, buf);
+
+    /* HH:MM with the selected field underlined */
+    uint32_t tod = m->start % SECONDS_PER_DAY;
+    char hh[4];
+    char mm[4];
+    snprintf(hh, sizeof(hh), "%02lu", (unsigned long)(tod / 3600));
+    snprintf(mm, sizeof(mm), "%02lu", (unsigned long)((tod % 3600) / 60));
+    snprintf(buf, sizeof(buf), "%s:%s", hh, mm);
+    canvas_set_font(canvas, FontBigNumbers);
+    int w = canvas_string_width(canvas, buf);
+    int x = 64 - w / 2;
+    canvas_draw_str(canvas, x, 27, buf);
+    int hw = canvas_string_width(canvas, hh);
+    if(m->field == 0) {
+        canvas_draw_box(canvas, x, 29, hw, 2);
+    } else {
+        snprintf(buf, sizeof(buf), "%s:", hh);
+        int mx = x + canvas_string_width(canvas, buf);
+        canvas_draw_box(canvas, mx, 29, canvas_string_width(canvas, mm), 2);
+    }
+
+    canvas_set_font(canvas, FontSecondary);
+    char dur[16];
+    format_duration(m->now > m->start ? m->now - m->start : 0, dur, sizeof(dur));
+    snprintf(buf, sizeof(buf), "%s: %s", m->name, dur);
+    canvas_draw_str_aligned(canvas, 64, 33, AlignCenter, AlignTop, buf);
+    if(m->has_prev) {
+        format_duration(m->start > m->prev_start ? m->start - m->prev_start : 0, dur, sizeof(dur));
+        snprintf(buf, sizeof(buf), "before: %s %s", m->prev_name, dur);
+        canvas_draw_str_aligned(canvas, 64, 43, AlignCenter, AlignTop, buf);
+    }
+
+    elements_button_center(canvas, "Save");
+}
+
+static bool start_edit_input(InputEvent* event, void* ctx) {
+    TimeToApp* app = ctx;
+    if(event->type != InputTypeShort && event->type != InputTypeRepeat) return false;
+
+    if(event->key == InputKeyOk) {
+        if(event->type != InputTypeShort) return true;
+        uint32_t start = 0;
+        with_view_model(app->start_edit_view, StartEditModel * m, { start = m->start; }, false);
+        start_edit_apply(app, start);
+        view_dispatcher_switch_to_view(app->view_dispatcher, ViewTracker);
+        return true;
+    }
+
+    bool handled = true;
+    with_view_model(
+        app->start_edit_view,
+        StartEditModel * m,
+        {
+            m->now = now_ts();
+            int64_t step = m->field == 0 ? 3600 : 60;
+            switch(event->key) {
+            case InputKeyLeft:
+                m->field = 0;
+                break;
+            case InputKeyRight:
+                m->field = 1;
+                break;
+            case InputKeyUp:
+            case InputKeyDown: {
+                /* move in whole minutes: drop the seconds before stepping */
+                int64_t v = (int64_t)(m->start - m->start % 60);
+                if(event->key == InputKeyUp) {
+                    v += step;
+                } else {
+                    if(m->start % 60) v += 60;
+                    v -= step;
+                }
+                if(v > (int64_t)m->now) v = m->now;
+                if(v < (int64_t)m->min) v = m->min;
+                m->start = (uint32_t)v;
+                break;
+            }
+            default:
+                handled = false;
+                break;
+            }
+        },
+        true);
+    return handled;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -979,6 +1235,10 @@ static void delete_rebuild(TimeToApp* app) {
 static void manage_cb(void* ctx, uint32_t index) {
     TimeToApp* app = ctx;
     switch(index) {
+    case ManageStartTime:
+        if(!app->tracking) break;
+        start_edit_open(app);
+        break;
     case ManageAdd:
         app->input_buf[0] = '\0';
         text_input_reset(app->text_input);
@@ -1034,6 +1294,8 @@ static bool custom_event_cb(void* ctx, uint32_t event) {
             refresh_today_prev(app);
         }
         tracker_update_model(app);
+        with_view_model(
+            app->start_edit_view, StartEditModel * m, { m->now = now_ts(); }, true);
         return true;
     }
     if(event == EventNfcTag) {
@@ -1103,6 +1365,7 @@ static TimeToApp* timeto_alloc(void) {
     /* Manage */
     app->manage = submenu_alloc();
     submenu_set_header(app->manage, "Edit");
+    submenu_add_item(app->manage, "Change start time", ManageStartTime, manage_cb, app);
     submenu_add_item(app->manage, "Add activity", ManageAdd, manage_cb, app);
     submenu_add_item(app->manage, "Delete activity", ManageDelete, manage_cb, app);
     submenu_add_item(app->manage, "Link NFC tag", ManageNfcLink, manage_cb, app);
@@ -1144,6 +1407,15 @@ static TimeToApp* timeto_alloc(void) {
     view_dispatcher_add_view(
         app->view_dispatcher, ViewNfcUnlink, submenu_get_view(app->nfc_unlink_menu));
 
+    /* Change start time */
+    app->start_edit_view = view_alloc();
+    view_allocate_model(app->start_edit_view, ViewModelTypeLocking, sizeof(StartEditModel));
+    view_set_context(app->start_edit_view, app);
+    view_set_draw_callback(app->start_edit_view, start_edit_draw);
+    view_set_input_callback(app->start_edit_view, start_edit_input);
+    view_set_previous_callback(app->start_edit_view, nav_manage);
+    view_dispatcher_add_view(app->view_dispatcher, ViewStartEdit, app->start_edit_view);
+
     tracker_update_model(app);
 
     app->timer = furi_timer_alloc(timer_cb, FuriTimerTypePeriodic, app);
@@ -1166,6 +1438,7 @@ static void timeto_free(TimeToApp* app) {
     view_dispatcher_remove_view(app->view_dispatcher, ViewNfcScan);
     view_dispatcher_remove_view(app->view_dispatcher, ViewNfcLink);
     view_dispatcher_remove_view(app->view_dispatcher, ViewNfcUnlink);
+    view_dispatcher_remove_view(app->view_dispatcher, ViewStartEdit);
 
     view_free(app->tracker_view);
     view_free(app->summary_view);
@@ -1176,6 +1449,7 @@ static void timeto_free(TimeToApp* app) {
     view_free(app->nfc_scan_view);
     submenu_free(app->nfc_link_menu);
     submenu_free(app->nfc_unlink_menu);
+    view_free(app->start_edit_view);
     view_dispatcher_free(app->view_dispatcher);
 
     furi_record_close(RECORD_NOTIFICATION);

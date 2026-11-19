@@ -14,13 +14,28 @@ checklists, just activities and time.
 | Tracker  | OK / Up       | Switch activity                              |
 | Tracker  | Down          | Scan an NFC tag to switch activity           |
 | Tracker  | Right         | Stats (time per activity, per day)           |
-| Tracker  | Left          | Edit: activities, NFC tags, stop tracking    |
+| Tracker  | Left          | Edit: start time, activities, NFC tags, stop |
 | Tracker  | Back          | Exit (tracking keeps running)                |
 | Stats    | Left / Right  | Previous / next day                          |
 | Stats    | Up / Down     | Scroll                                       |
+| Start time | Left / Right | Pick hours or minutes                       |
+| Start time | Up / Down    | Change the time (hold to repeat)            |
+| Start time | OK / Back    | Save / cancel                               |
 
 The tracker screen shows the current activity, how long you've been on it, when
 it started, and the total for that activity today.
+
+## Changing the start time
+
+Switched late? Under **Edit** (Left) choose **Change start time** to set when
+the current activity really started. The screen shows the new duration of the
+current activity and, below it, the activity before it.
+
+If the previous activity ended when the current one started (you switched
+from it), its end time moves with the start time, so the timeline has no gaps
+or overlaps. The last row of `log.csv` is updated. Otherwise the start time
+can't be earlier than the end of the last logged interval. It can't be later
+than now.
 
 ## NFC tags
 

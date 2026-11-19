@@ -8,6 +8,18 @@ The version matches `fap_version` in `application.fam`.
 
 ## [Unreleased]
 
+## [1.2] - 2026-11-19
+
+### Added
+
+- "Change start time" in the Edit menu: set when the running activity started,
+  for when you switched late. Left / Right pick hours or minutes, Up / Down
+  change them (hold to repeat), OK saves.
+- If the previous activity ended when the running one started, its end time
+  moves too (the last row of `log.csv` is updated), so there are no gaps or
+  overlaps. Otherwise the start can't go earlier than the end of the last
+  logged interval. The start can't be later than now.
+
 ## [1.1] - 2026-11-19
 
 ### Added
@@ -46,6 +58,7 @@ The version matches `fap_version` in `application.fam`.
     on a computer.
 - GitHub Actions workflow that builds the `.fap` against the release and dev SDKs.
 
-[Unreleased]: https://github.com/daniebker/flipper_timeto/compare/v1.1...HEAD
+[Unreleased]: https://github.com/daniebker/flipper_timeto/compare/v1.2...HEAD
+[1.2]: https://github.com/daniebker/flipper_timeto/compare/v1.1...v1.2
 [1.1]: https://github.com/daniebker/flipper_timeto/compare/v1.0...v1.1
 [1.0]: https://github.com/daniebker/flipper_timeto/releases/tag/v1.0
