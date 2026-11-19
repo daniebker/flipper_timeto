@@ -11,6 +11,11 @@
  *   /ext/apps_data/timeto/activities.txt  one activity name per line (editable)
  *   /ext/apps_data/timeto/current.txt     running interval: "<start_ts>,<name>"
  *   /ext/apps_data/timeto/log.csv         finished intervals
+ *   /ext/apps_data/timeto/tags.txt        NFC tags: "<uid hex>,<activity>"
+ *
+ * NFC: scanning a linked tag (any ISO14443-3A tag: NTAG, Ultralight, Mifare
+ * Classic, DESFire...) switches to its activity. An unknown tag is linked to
+ * an activity the first time it is scanned.
  */
 
 #include <furi.h>
@@ -24,6 +29,10 @@
 #include <storage/storage.h>
 #include <notification/notification_messages.h>
 #include <datetime/datetime.h>
+#include <nfc/nfc.h>
+#include <nfc/nfc_poller.h>
+#include <nfc/protocols/iso14443_3a/iso14443_3a.h>
+#include <nfc/protocols/iso14443_3a/iso14443_3a_poller.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,12 +45,15 @@
 #define CURRENT_PATH     TIMETO_DIR "/current.txt"
 #define LOG_PATH         TIMETO_DIR "/log.csv"
 #define LOG_HEADER       "start_ts,end_ts,duration_s,start,end,activity\n"
+#define TAGS_PATH        TIMETO_DIR "/tags.txt"
 
 #define MAX_ACTIVITIES   24
 #define NAME_LEN         24
 #define SECONDS_PER_DAY  86400UL
 #define SUMMARY_ROWS     4
 #define SUMMARY_MAX      (MAX_ACTIVITIES + 4)
+#define MAX_TAGS         32
+#define UID_STR_LEN      (ISO14443_3A_MAX_UID_SIZE * 2 + 1)
 
 static const char* const default_activities[] = {
     "Work",
@@ -63,17 +75,32 @@ typedef enum {
     ViewManage,
     ViewDelete,
     ViewTextInput,
+    ViewNfcScan,
+    ViewNfcLink,
+    ViewNfcUnlink,
 } TimeToView;
 
 typedef enum {
     EventTick = 1,
+    EventNfcTag,
 } TimeToEvent;
 
 typedef enum {
     ManageAdd,
     ManageDelete,
+    ManageNfcLink,
+    ManageNfcUnlink,
     ManageStop,
 } ManageItem;
+
+typedef struct {
+    char uid[UID_STR_LEN];
+    char name[NAME_LEN];
+} NfcTag;
+
+typedef struct {
+    bool link_mode;
+} NfcScanModel;
 
 typedef struct {
     bool tracking;
@@ -104,7 +131,22 @@ typedef struct {
     Submenu* manage;
     Submenu* delete_menu;
     TextInput* text_input;
+    View* nfc_scan_view;
+    Submenu* nfc_link_menu;
+    Submenu* nfc_unlink_menu;
     FuriTimer* timer;
+
+    /* NFC: allocated only while scanning, so the app doesn't hold the radio */
+    Nfc* nfc;
+    NfcPoller* nfc_poller;
+    bool nfc_scanning;
+    bool nfc_link_mode; /* always ask which activity, even for a known tag */
+    uint8_t nfc_uid[ISO14443_3A_MAX_UID_SIZE];
+    size_t nfc_uid_len;
+    char scanned_uid[UID_STR_LEN];
+
+    NfcTag tags[MAX_TAGS];
+    size_t tag_count;
 
     char activities[MAX_ACTIVITIES][NAME_LEN];
     size_t activity_count;
@@ -339,6 +381,61 @@ static void append_log(TimeToApp* app, uint32_t start, uint32_t end, const char*
     furi_string_free(line);
 }
 
+static int find_tag(TimeToApp* app, const char* uid) {
+    for(size_t i = 0; i < app->tag_count; i++) {
+        if(strcmp(app->tags[i].uid, uid) == 0) return (int)i;
+    }
+    return -1;
+}
+
+static void save_tags(TimeToApp* app) {
+    FuriString* text = furi_string_alloc();
+    for(size_t i = 0; i < app->tag_count; i++) {
+        furi_string_cat_printf(text, "%s,%s\n", app->tags[i].uid, app->tags[i].name);
+    }
+    write_text_file(app, TAGS_PATH, furi_string_get_cstr(text));
+    furi_string_free(text);
+}
+
+/* Links uid to name, replacing an existing link for the same tag. */
+static bool set_tag(TimeToApp* app, const char* uid, const char* raw_name) {
+    char name[NAME_LEN];
+    strlcpy(name, raw_name, sizeof(name));
+    sanitize_name(name);
+    if(uid[0] == '\0' || name[0] == '\0') return false;
+    int idx = find_tag(app, uid);
+    if(idx < 0) {
+        if(app->tag_count >= MAX_TAGS) return false;
+        idx = (int)app->tag_count++;
+        strlcpy(app->tags[idx].uid, uid, UID_STR_LEN);
+    }
+    strlcpy(app->tags[idx].name, name, NAME_LEN);
+    return true;
+}
+
+/* tags.txt line: <uid hex>,<activity> */
+static void tag_line_cb(const char* line, void* ctx) {
+    TimeToApp* app = ctx;
+    const char* comma = strchr(line, ',');
+    if(!comma) return;
+    size_t uid_len = (size_t)(comma - line);
+    if(uid_len == 0 || uid_len >= UID_STR_LEN) return;
+    char uid[UID_STR_LEN];
+    for(size_t i = 0; i < uid_len; i++) {
+        char c = line[i];
+        if(c >= 'a' && c <= 'f') c = (char)(c - 'a' + 'A');
+        if(!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'))) return;
+        uid[i] = c;
+    }
+    uid[uid_len] = '\0';
+    set_tag(app, uid, comma + 1);
+}
+
+static void load_tags(TimeToApp* app) {
+    app->tag_count = 0;
+    read_lines(app, TAGS_PATH, tag_line_cb, app);
+}
+
 /* ------------------------------------------------------------------------ */
 /* Totals                                                                   */
 /* ------------------------------------------------------------------------ */
@@ -445,9 +542,10 @@ static void tracker_draw(Canvas* canvas, void* ctx) {
     if(!m->tracking) {
         canvas_draw_str_aligned(canvas, 0, 0, AlignLeft, AlignTop, "TimeTo");
         canvas_set_font(canvas, FontPrimary);
-        canvas_draw_str_aligned(canvas, 64, 24, AlignCenter, AlignCenter, "Not tracking");
+        canvas_draw_str_aligned(canvas, 64, 20, AlignCenter, AlignCenter, "Not tracking");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignCenter, "Pick an activity to start");
+        canvas_draw_str_aligned(canvas, 64, 33, AlignCenter, AlignCenter, "Pick an activity to start");
+        canvas_draw_str_aligned(canvas, 64, 43, AlignCenter, AlignCenter, "or scan an NFC tag (Down)");
         elements_button_center(canvas, "Start");
         elements_button_left(canvas, "Edit");
         elements_button_right(canvas, "Stats");
@@ -495,14 +593,17 @@ static void tracker_draw(Canvas* canvas, void* ctx) {
 
 static void picker_rebuild(TimeToApp* app);
 static void summary_refresh(TimeToApp* app);
+static void nfc_scan_start(TimeToApp* app, bool link_mode);
 
 static bool tracker_input(InputEvent* event, void* ctx) {
     TimeToApp* app = ctx;
     if(event->type != InputTypeShort) return false;
     switch(event->key) {
+    case InputKeyDown:
+        nfc_scan_start(app, false);
+        return true;
     case InputKeyOk:
     case InputKeyUp:
-    case InputKeyDown:
         picker_rebuild(app);
         view_dispatcher_switch_to_view(app->view_dispatcher, ViewPicker);
         return true;
@@ -572,6 +673,157 @@ static void picker_rebuild(TimeToApp* app) {
         if(is_current) selected = i;
     }
     submenu_set_selected_item(app->picker, selected);
+}
+
+/* ------------------------------------------------------------------------ */
+/* NFC                                                                      */
+/* ------------------------------------------------------------------------ */
+
+/* Runs on the NFC worker thread. */
+static NfcCommand nfc_poller_cb(NfcGenericEvent event, void* ctx) {
+    TimeToApp* app = ctx;
+    furi_assert(event.protocol == NfcProtocolIso14443_3a);
+    const Iso14443_3aPollerEvent* ev = event.event_data;
+    if(ev->type != Iso14443_3aPollerEventTypeReady) {
+        return NfcCommandContinue; /* no tag yet, keep polling */
+    }
+    const Iso14443_3aData* data = (const Iso14443_3aData*)nfc_poller_get_data(app->nfc_poller);
+    size_t len = 0;
+    const uint8_t* uid = iso14443_3a_get_uid(data, &len);
+    if(len > sizeof(app->nfc_uid)) len = sizeof(app->nfc_uid);
+    memcpy(app->nfc_uid, uid, len);
+    app->nfc_uid_len = len;
+    view_dispatcher_send_custom_event(app->view_dispatcher, EventNfcTag);
+    return NfcCommandStop;
+}
+
+/* Safe to call when not scanning. Must run on the app (GUI) thread. */
+static void nfc_scan_stop(TimeToApp* app) {
+    if(!app->nfc_scanning) return;
+    app->nfc_scanning = false;
+    nfc_poller_stop(app->nfc_poller);
+    nfc_poller_free(app->nfc_poller);
+    app->nfc_poller = NULL;
+    nfc_free(app->nfc);
+    app->nfc = NULL;
+    notification_message(app->notifications, &sequence_blink_stop);
+}
+
+static void nfc_scan_start(TimeToApp* app, bool link_mode) {
+    nfc_scan_stop(app);
+    app->nfc_link_mode = link_mode;
+    app->nfc_uid_len = 0;
+    with_view_model(
+        app->nfc_scan_view, NfcScanModel * model, { model->link_mode = link_mode; }, true);
+    view_dispatcher_switch_to_view(app->view_dispatcher, ViewNfcScan);
+
+    app->nfc = nfc_alloc();
+    app->nfc_poller = nfc_poller_alloc(app->nfc, NfcProtocolIso14443_3a);
+    app->nfc_scanning = true;
+    nfc_poller_start(app->nfc_poller, nfc_poller_cb, app);
+    notification_message(app->notifications, &sequence_blink_start_cyan);
+}
+
+static void nfc_scan_draw(Canvas* canvas, void* ctx) {
+    NfcScanModel* m = ctx;
+    canvas_clear(canvas);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(
+        canvas, 64, 2, AlignCenter, AlignTop, m->link_mode ? "Link NFC tag" : "Scan NFC tag");
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(canvas, 64, 24, AlignCenter, AlignTop, "Hold a tag to the back");
+    canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignTop, "of the Flipper");
+    canvas_draw_str_aligned(canvas, 64, 54, AlignCenter, AlignTop, "Back to cancel");
+}
+
+static void nfc_scan_exit(void* ctx) {
+    nfc_scan_stop(ctx);
+}
+
+static void nfc_link_cb(void* ctx, uint32_t index) {
+    TimeToApp* app = ctx;
+    if(index < app->activity_count) {
+        const char* name = app->activities[index];
+        if(set_tag(app, app->scanned_uid, name)) {
+            save_tags(app);
+        }
+        if(app->tracking && strcmp(app->current, name) == 0) {
+            notification_message(app->notifications, &sequence_single_vibro);
+        } else {
+            switch_activity(app, name);
+        }
+    }
+    view_dispatcher_switch_to_view(app->view_dispatcher, ViewTracker);
+}
+
+static void nfc_link_rebuild(TimeToApp* app, const char* header) {
+    submenu_reset(app->nfc_link_menu);
+    submenu_set_header(app->nfc_link_menu, header);
+    uint32_t selected = 0;
+    int tag = find_tag(app, app->scanned_uid);
+    for(size_t i = 0; i < app->activity_count; i++) {
+        submenu_add_item(app->nfc_link_menu, app->activities[i], i, nfc_link_cb, app);
+        if(tag >= 0 && strcmp(app->tags[tag].name, app->activities[i]) == 0) selected = i;
+    }
+    submenu_set_selected_item(app->nfc_link_menu, selected);
+}
+
+static void nfc_handle_tag(TimeToApp* app) {
+    if(!app->nfc_scanning) return; /* scan was cancelled meanwhile */
+    nfc_scan_stop(app);
+
+    app->scanned_uid[0] = '\0';
+    for(size_t i = 0; i < app->nfc_uid_len; i++) {
+        snprintf(app->scanned_uid + i * 2, 3, "%02X", app->nfc_uid[i]);
+    }
+    if(app->scanned_uid[0] == '\0') {
+        view_dispatcher_switch_to_view(app->view_dispatcher, ViewTracker);
+        return;
+    }
+
+    int tag = find_tag(app, app->scanned_uid);
+    /* A tag whose activity was deleted is treated like a new tag. */
+    bool known = tag >= 0 && find_activity(app, app->tags[tag].name) >= 0;
+
+    if(known && !app->nfc_link_mode) {
+        const char* name = app->tags[tag].name;
+        if(app->tracking && strcmp(app->current, name) == 0) {
+            notification_message(app->notifications, &sequence_single_vibro);
+        } else {
+            switch_activity(app, name);
+        }
+        view_dispatcher_switch_to_view(app->view_dispatcher, ViewTracker);
+        return;
+    }
+
+    if(app->activity_count == 0) {
+        view_dispatcher_switch_to_view(app->view_dispatcher, ViewTracker);
+        return;
+    }
+    nfc_link_rebuild(app, known ? "Link tag to" : "New tag, link to");
+    view_dispatcher_switch_to_view(app->view_dispatcher, ViewNfcLink);
+}
+
+static void nfc_unlink_cb(void* ctx, uint32_t index) {
+    TimeToApp* app = ctx;
+    if(index < app->tag_count) {
+        for(size_t i = index; i + 1 < app->tag_count; i++) {
+            app->tags[i] = app->tags[i + 1];
+        }
+        app->tag_count--;
+        save_tags(app);
+    }
+    view_dispatcher_switch_to_view(app->view_dispatcher, ViewManage);
+}
+
+static void nfc_unlink_rebuild(TimeToApp* app) {
+    submenu_reset(app->nfc_unlink_menu);
+    submenu_set_header(app->nfc_unlink_menu, "Unlink NFC tag");
+    char label[NAME_LEN + UID_STR_LEN + 4];
+    for(size_t i = 0; i < app->tag_count; i++) {
+        snprintf(label, sizeof(label), "%s %s", app->tags[i].name, app->tags[i].uid);
+        submenu_add_item(app->nfc_unlink_menu, label, i, nfc_unlink_cb, app);
+    }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -739,6 +991,14 @@ static void manage_cb(void* ctx, uint32_t index) {
         delete_rebuild(app);
         view_dispatcher_switch_to_view(app->view_dispatcher, ViewDelete);
         break;
+    case ManageNfcLink:
+        nfc_scan_start(app, true);
+        break;
+    case ManageNfcUnlink:
+        if(app->tag_count == 0) break;
+        nfc_unlink_rebuild(app);
+        view_dispatcher_switch_to_view(app->view_dispatcher, ViewNfcUnlink);
+        break;
     case ManageStop:
         stop_tracking(app);
         view_dispatcher_switch_to_view(app->view_dispatcher, ViewTracker);
@@ -776,6 +1036,10 @@ static bool custom_event_cb(void* ctx, uint32_t event) {
         tracker_update_model(app);
         return true;
     }
+    if(event == EventNfcTag) {
+        nfc_handle_tag(app);
+        return true;
+    }
     return false;
 }
 
@@ -804,6 +1068,7 @@ static TimeToApp* timeto_alloc(void) {
     storage_ensure_dir(app);
     load_activities(app);
     load_current(app);
+    load_tags(app);
     refresh_today_prev(app);
 
     app->view_dispatcher = view_dispatcher_alloc();
@@ -840,6 +1105,8 @@ static TimeToApp* timeto_alloc(void) {
     submenu_set_header(app->manage, "Edit");
     submenu_add_item(app->manage, "Add activity", ManageAdd, manage_cb, app);
     submenu_add_item(app->manage, "Delete activity", ManageDelete, manage_cb, app);
+    submenu_add_item(app->manage, "Link NFC tag", ManageNfcLink, manage_cb, app);
+    submenu_add_item(app->manage, "Unlink NFC tag", ManageNfcUnlink, manage_cb, app);
     submenu_add_item(app->manage, "Stop tracking", ManageStop, manage_cb, app);
     view_set_previous_callback(submenu_get_view(app->manage), nav_tracker);
     view_dispatcher_add_view(app->view_dispatcher, ViewManage, submenu_get_view(app->manage));
@@ -856,6 +1123,27 @@ static TimeToApp* timeto_alloc(void) {
     view_dispatcher_add_view(
         app->view_dispatcher, ViewTextInput, text_input_get_view(app->text_input));
 
+    /* NFC scan */
+    app->nfc_scan_view = view_alloc();
+    view_allocate_model(app->nfc_scan_view, ViewModelTypeLocking, sizeof(NfcScanModel));
+    view_set_context(app->nfc_scan_view, app);
+    view_set_draw_callback(app->nfc_scan_view, nfc_scan_draw);
+    view_set_exit_callback(app->nfc_scan_view, nfc_scan_exit);
+    view_set_previous_callback(app->nfc_scan_view, nav_tracker);
+    view_dispatcher_add_view(app->view_dispatcher, ViewNfcScan, app->nfc_scan_view);
+
+    /* NFC link: pick the activity for a scanned tag */
+    app->nfc_link_menu = submenu_alloc();
+    view_set_previous_callback(submenu_get_view(app->nfc_link_menu), nav_tracker);
+    view_dispatcher_add_view(
+        app->view_dispatcher, ViewNfcLink, submenu_get_view(app->nfc_link_menu));
+
+    /* NFC unlink */
+    app->nfc_unlink_menu = submenu_alloc();
+    view_set_previous_callback(submenu_get_view(app->nfc_unlink_menu), nav_manage);
+    view_dispatcher_add_view(
+        app->view_dispatcher, ViewNfcUnlink, submenu_get_view(app->nfc_unlink_menu));
+
     tracker_update_model(app);
 
     app->timer = furi_timer_alloc(timer_cb, FuriTimerTypePeriodic, app);
@@ -867,6 +1155,7 @@ static TimeToApp* timeto_alloc(void) {
 static void timeto_free(TimeToApp* app) {
     furi_timer_stop(app->timer);
     furi_timer_free(app->timer);
+    nfc_scan_stop(app);
 
     view_dispatcher_remove_view(app->view_dispatcher, ViewTracker);
     view_dispatcher_remove_view(app->view_dispatcher, ViewSummary);
@@ -874,6 +1163,9 @@ static void timeto_free(TimeToApp* app) {
     view_dispatcher_remove_view(app->view_dispatcher, ViewManage);
     view_dispatcher_remove_view(app->view_dispatcher, ViewDelete);
     view_dispatcher_remove_view(app->view_dispatcher, ViewTextInput);
+    view_dispatcher_remove_view(app->view_dispatcher, ViewNfcScan);
+    view_dispatcher_remove_view(app->view_dispatcher, ViewNfcLink);
+    view_dispatcher_remove_view(app->view_dispatcher, ViewNfcUnlink);
 
     view_free(app->tracker_view);
     view_free(app->summary_view);
@@ -881,6 +1173,9 @@ static void timeto_free(TimeToApp* app) {
     submenu_free(app->manage);
     submenu_free(app->delete_menu);
     text_input_free(app->text_input);
+    view_free(app->nfc_scan_view);
+    submenu_free(app->nfc_link_menu);
+    submenu_free(app->nfc_unlink_menu);
     view_dispatcher_free(app->view_dispatcher);
 
     furi_record_close(RECORD_NOTIFICATION);

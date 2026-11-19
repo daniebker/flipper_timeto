@@ -7,6 +7,6 @@ App(
     stack_size=4 * 1024,
     fap_icon="timeto.png",
     fap_category="Tools",
-    fap_version="1.0",
-    fap_description="Continuous time tracker. Always tracking one activity; logs to SD card.",
+    fap_version="1.1",
+    fap_description="Continuous time tracker. Always tracking one activity; logs to SD card. Scan NFC tags to switch.",
 )

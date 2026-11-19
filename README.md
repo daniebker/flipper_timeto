@@ -11,15 +11,37 @@ checklists, just activities and time.
 
 | Screen   | Button        | Action                                      |
 |----------|---------------|---------------------------------------------|
-| Tracker  | OK / Up / Down| Switch activity                              |
+| Tracker  | OK / Up       | Switch activity                              |
+| Tracker  | Down          | Scan an NFC tag to switch activity           |
 | Tracker  | Right         | Stats (time per activity, per day)           |
-| Tracker  | Left          | Edit: add / delete activities, stop tracking |
+| Tracker  | Left          | Edit: activities, NFC tags, stop tracking    |
 | Tracker  | Back          | Exit (tracking keeps running)                |
 | Stats    | Left / Right  | Previous / next day                          |
 | Stats    | Up / Down     | Scroll                                       |
 
 The tracker screen shows the current activity, how long you've been on it, when
 it started, and the total for that activity today.
+
+## NFC tags
+
+You can stick NFC tags around the place (on your desk, by the door, on the
+gym bag) and start an activity by scanning one.
+
+1. On the tracker screen press **Down**, then hold a tag to the back of the
+   Flipper.
+2. The first time you scan a tag, pick the activity to link it to. Tracking
+   switches to that activity straight away.
+3. After that, scanning the tag switches to its activity. If you are already
+   on that activity, the Flipper just vibrates.
+
+Under **Edit** (Left) you can **Link NFC tag** to change a tag's activity, or
+**Unlink NFC tag** to forget it. If you delete an activity, its tags ask for a
+new activity the next time you scan them.
+
+Any ISO14443-3A tag works: NTAG213/215/216 stickers, Mifare Ultralight,
+Mifare Classic, DESFire, and most transit and access cards. The tag is
+identified only by its UID, so nothing is written to it. The app can only scan
+while it is open.
 
 ## Saving to the SD card
 
@@ -37,6 +59,8 @@ Everything goes in `/ext/apps_data/timeto/`:
 
 - `activities.txt`: one activity per line. You can edit it on a computer or in
   the app. If it's missing, a default list is created.
+- `tags.txt`: linked NFC tags, one per line as `uid,activity`
+  (e.g. `04A1B2C3D4E580,Work`).
 
 Times come from the Flipper's clock (local time), so set the clock correctly.
 

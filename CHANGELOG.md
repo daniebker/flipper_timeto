@@ -8,6 +8,22 @@ The version matches `fap_version` in `application.fam`.
 
 ## [Unreleased]
 
+## [1.1] - 2026-11-19
+
+### Added
+
+- Scan an NFC tag to start an activity: press Down on the tracker screen and
+  hold a tag to the Flipper. A new tag is linked to an activity you pick the
+  first time it is scanned; after that, scanning it switches to that activity.
+  Any ISO14443-3A tag works (NTAG, Mifare Ultralight, Mifare Classic, DESFire).
+- "Link NFC tag" and "Unlink NFC tag" in the Edit menu.
+- `tags.txt` on the SD card stores the links (`uid,activity`).
+
+### Changed
+
+- Down on the tracker screen now scans an NFC tag instead of opening the
+  activity picker (OK and Up still open it).
+
 ## [1.0] - 2026-11-18
 
 ### Added
@@ -30,5 +46,6 @@ The version matches `fap_version` in `application.fam`.
     on a computer.
 - GitHub Actions workflow that builds the `.fap` against the release and dev SDKs.
 
-[Unreleased]: https://github.com/daniebker/flipper_timeto/compare/v1.0...HEAD
+[Unreleased]: https://github.com/daniebker/flipper_timeto/compare/v1.1...HEAD
+[1.1]: https://github.com/daniebker/flipper_timeto/compare/v1.0...v1.1
 [1.0]: https://github.com/daniebker/flipper_timeto/releases/tag/v1.0
