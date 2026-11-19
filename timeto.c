@@ -802,7 +802,7 @@ static void start_edit_apply(TimeToApp* app, uint32_t new_start) {
 
 static void start_edit_draw(Canvas* canvas, void* ctx) {
     StartEditModel* m = ctx;
-    char buf[32];
+    char buf[NAME_LEN + 32];
     canvas_clear(canvas);
 
     canvas_set_font(canvas, FontPrimary);
